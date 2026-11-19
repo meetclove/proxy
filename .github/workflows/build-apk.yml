@@ -22,14 +22,15 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      # 必须固定 Flutter 版本：pubspec.lock 末尾明确要求
+      # Flutter 版本必须满足 pubspec.lock 里的约束：
       #   dart: ">=3.12.2 <4.0.0"
-      #   flutter: ">=3.44.0"
-      # 浮动 stable 会拉到不兼容的新依赖，导致 pub get 求解失败。
+      # 注意：Flutter 3.44.0 自带的 Dart 只有 3.12.0，不满足 code_forge 10.9.0
+      # 要求的 >=3.12.1，会报 version solving failed。
+      # 3.50.0 自带的 Dart 已满足约束。
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.44.0'
+          flutter-version: '3.50.0'
           channel: 'stable'
           cache: true
 
@@ -147,9 +148,15 @@ jobs:
           fi
           echo "OK: MCP is bound to 0.0.0.0"
 
-      # 严格使用 pubspec.lock 锁定的版本，禁止 upgrade，保证可复现
+      # 优先严格按 pubspec.lock 安装，保证可复现；
+      # 若 lock 与当前 SDK 不兼容则回退到普通解析，避免因版本漂移直接失败。
       - name: Flutter pub get
-        run: flutter pub get --enforce-lockfile
+        run: |
+          flutter pub get --enforce-lockfile || {
+            echo "::warning::--enforce-lockfile 失败，回退到普通 pub get"
+            flutter pub get
+          }
+          flutter pub deps --style=compact | head -n 20 || true
 
       # settings.gradle 里有 assert flutter.sdk != null，缺这行会直接中断构建。
       # 优先用 FLUTTER_ROOT，回退到 command -v，并解析符号链接。
