@@ -158,14 +158,28 @@ jobs:
           fi
           echo "OK: MCP is bound to 0.0.0.0"
 
-      # 优先严格按 pubspec.lock 安装，保证可复现；
-      # 若 lock 与当前 SDK 不兼容则回退到普通解析，避免因版本漂移直接失败。
+      # 【必须在 pub get 之前执行】
+      # Flutter 3.44.0 自带 Dart 3.12.0，而 code_forge >=10.5.0 要求 Dart >=3.12.1，
+      # 不降级就会 version solving failed。这是 GitHub 报错里给出的官方建议。
+      - name: Adjust deps for Flutter 3.44
+        run: |
+          set -euo pipefail
+          echo "---- pubspec before ----"
+          grep -n "code_forge" pubspec.yaml || true
+
+          sed -i "s|code_forge: \^10\.[0-9.]*|code_forge: ^10.4.1|" pubspec.yaml
+
+          echo "---- pubspec after ----"
+          grep -n "code_forge" pubspec.yaml || true
+
+          # 旧 lock 锁 code_forge 10.9.0（声明 Dart >=3.12.2），与新约束冲突，删掉重新解析
+          rm -f pubspec.lock
+          echo "pubspec.lock 已删除，将由 pub 重新生成"
+
+      # lock 已在上一阶段删除，这里直接普通解析
       - name: Flutter pub get
         run: |
-          flutter pub get --enforce-lockfile || {
-            echo "::warning::--enforce-lockfile 失败，回退到普通 pub get"
-            flutter pub get
-          }
+          flutter pub get
           flutter pub deps --style=compact | head -n 20 || true
 
       # settings.gradle 里有 assert flutter.sdk != null，缺这行会直接中断构建。
@@ -184,33 +198,6 @@ jobs:
 
       - name: Analyze (non-blocking)
         run: flutter analyze --no-fatal-infos --no-fatal-warnings || true
-
-      # 关键：不要升 AGP。
-      # Flutter 3.50 + AGP 8.11.1 会报 ApplicationExtension.getDefaultConfig() 不兼容，
-      # 而升 AGP 9 需要连带重写大量构建脚本，风险更高。
-      #
-      # 所以锁定原作者验证过的组合：Flutter 3.44.0 + AGP 8.11.1 + Gradle 9.3.1，
-      # 并用 GitHub 报错里给出的官方建议解决 Dart 约束冲突：
-      #   code_forge >=10.5.0 要求 Dart >=3.12.1，而 Flutter 3.44.0 只有 Dart 3.12.0
-      #   -> 降级到 ^10.4.1
-      - name: Adjust deps for Flutter 3.44
-        run: |
-          set -euo pipefail
-          echo "---- pubspec before ----"
-          grep -n "code_forge" pubspec.yaml || true
-
-          sed -i "s|code_forge: \^10\.[0-9.]*|code_forge: ^10.4.1|" pubspec.yaml
-
-          echo "---- pubspec after ----"
-          grep -n "code_forge" pubspec.yaml || true
-
-          # 旧 lock 锁的是 code_forge 10.9.0（要求 Dart >=3.12.2），与新约束冲突，
-          # 删掉让 pub 按新约束重新解析。
-          rm -f pubspec.lock
-
-          echo "---- agp/gradle (保持不动) ----"
-          grep -n "com.android.application" android/settings.gradle
-          grep -n "distributionUrl" android/gradle/wrapper/gradle-wrapper.properties
 
       # 本仓库 libapp.so / libflutter.so 只提供 arm64-v8a，
       # 其他 ABI 缺少产物会导致构建失败，所以必须指定 target-platform。
