@@ -1,0 +1,13 @@
+/.gradle
+/captures/
+/local.properties
+GeneratedPluginRegistrant.java
+
+# Remember to never publicly share your keystore.
+# See https://flutter.dev/docs/deployment/android#reference-the-keystore-from-the-app
+key.properties
+**/*.keystore
+**/*.jks
+/app/.cxx/
+# 注意：gradlew / gradle-wrapper.jar 不能忽略，
+# GitHub Actions 上需要它们才能执行 Gradle（flutter build apk 也会自动补齐）。

@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+用 GitHub Git Data API 推送文件，不需要安装 git。
+只用 Python 标准库（urllib），Termux / 任何 Linux 自带 python3 就能跑。
+
+用法：
+  export GITHUB_TOKEN=ghp_xxxxxxxx
+  export GITHUB_OWNER=你的用户名
+  export GITHUB_REPO=你的仓库名
+  export GITHUB_BRANCH=main          # 可选，默认 main
+
+  python3 push_to_github.py --dry-run   # 只预览，不推送
+  python3 push_to_github.py             # 推送改动文件（仓库已有源码时用）
+  python3 push_to_github.py --all       # 推送整个工程（仓库为空时用）
+
+重要：如果目标仓库里还没有这套源码，必须用 --all，
+否则只推 13 个改动文件，GitHub 上构建会因缺文件而失败。
+"""
+
+import base64
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+API = "https://api.github.com"
+
+# 仅推送改动文件时使用的清单（--all 模式会自动扫描全目录）
+# 100755 = 可执行（gradlew 必须是可执行，否则 CI 上跑不了）
+FILES = {
+    ".github/workflows/build-apk.yml": "100644",
+    ".gitignore": "100644",
+    "android/.gitignore": "100644",
+    "android/app/proguard-rules.pro": "100644",
+    "android/key.properties": "100644",
+    "android/app/proxypin.keystore": "100644",
+    "pubspec.lock": "100644",
+    "android/gradlew": "100755",
+    "android/gradlew.bat": "100644",
+    "android/gradle/wrapper/gradle-wrapper.jar": "100644",
+    "lib/network/mcp/mcp_server.dart": "100644",
+    "lib/ui/mobile/setting/mcp_server_page.dart": "100644",
+    "构建说明.md": "100644",
+}
+
+
+def api(method, path, token, payload=None, allow_404=False):
+    """调 GitHub REST API，返回解析后的 JSON。"""
+    url = API + path
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("Authorization", "Bearer " + token)
+    req.add_header("X-GitHub-Api-Version", "2022-11-28")
+    req.add_header("User-Agent", "proxybird-push-script")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            body = resp.read().decode("utf-8")
+            return json.loads(body) if body.strip() else {}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        # 空仓库：GitHub 对 ref 查询返回 409 (Git Repository is empty)，
+        # 对 contents 查询返回 404。两者都视为“目标不存在”，继续往下走。
+        if allow_404 and e.code in (404, 409):
+            return None
+        if e.code == 401:
+            raise RuntimeError(
+                "Token 无效或已过期（401）。请重新生成 Token。\n" + detail
+            )
+        if e.code == 403:
+            raise RuntimeError(
+                "权限不足（403）。常见原因：\n"
+                "  1. Token 没勾 repo 权限\n"
+                "  2. 推 .github/workflows 需要 workflow 权限（经典 Token 要勾 workflow）\n"
+                "  3. 细粒度 Token 需要把 Workflows 设为 Read and write\n" + detail
+            )
+        raise RuntimeError("%s %s -> HTTP %d\n%s" % (method, path, e.code, detail))
+
+
+# 整库推送时跳过的目录/文件（构建产物、本机缓存、CI 产物）
+SKIP_DIRS = {
+    ".git", ".dart_tool", "build", ".gradle", ".idea", ".vscode",
+    "__pycache__", "dist", ".pub-cache", ".fvm",
+}
+SKIP_SUFFIX = (".apk", ".aab", ".log", ".class", ".pyc")
+SKIP_EXACT = {
+    "android/local.properties",
+    ".flutter-plugins-dependencies",
+    ".flutter-plugins",
+    ".flutter_tool_state",
+    "analyze.log",
+    "build_httpcanary.log",
+}
+
+
+def collect_all(root):
+    """扫描整个工程目录，返回 [(相对路径, 模式, 字节)]。"""
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            abs_path = os.path.join(dirpath, name)
+            if not os.path.isfile(abs_path):
+                continue
+            rel = os.path.relpath(abs_path, root).replace(os.sep, "/")
+            if rel in SKIP_EXACT:
+                continue
+            if rel.lower().endswith(SKIP_SUFFIX):
+                continue
+            # 跳过推送脚本自身
+            if rel == "push_to_github.py":
+                continue
+            try:
+                with open(abs_path, "rb") as f:
+                    raw = f.read()
+            except OSError as e:
+                print("[跳过] 读不到 %s: %s" % (rel, e))
+                continue
+            # gradlew 必须可执行，否则 CI 跑不起来
+            mode = "100755" if name == "gradlew" else "100644"
+            out.append((rel, mode, raw))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def main():
+    root = os.path.dirname(os.path.abspath(__file__))
+    dry_run = "--dry-run" in sys.argv
+    push_all = "--all" in sys.argv
+
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    owner = os.environ.get("GITHUB_OWNER", "").strip()
+    repo = os.environ.get("GITHUB_REPO", "").strip()
+    branch = os.environ.get("GITHUB_BRANCH", "main").strip() or "main"
+
+    if not dry_run:
+        missing = [n for n, v in (
+            ("GITHUB_TOKEN", token),
+            ("GITHUB_OWNER", owner),
+            ("GITHUB_REPO", repo),
+        ) if not v]
+        if missing:
+            print("缺少环境变量: " + ", ".join(missing))
+            print("参考脚本开头的用法说明。")
+            return 1
+
+    # 1. 收集本地文件
+    if push_all:
+        print("模式: --all（推送整个工程）")
+        entries = collect_all(root)
+    else:
+        print("模式: 仅推送改动文件")
+        entries = []
+        for rel, mode in FILES.items():
+            abs_path = os.path.join(root, rel)
+            if not os.path.isfile(abs_path):
+                print("[跳过] 文件不存在: %s" % rel)
+                continue
+            with open(abs_path, "rb") as f:
+                raw = f.read()
+            entries.append((rel, mode, raw))
+
+    if not entries:
+        print("没有找到任何待推送文件，请确认脚本放在源码根目录。")
+        return 1
+
+    print("==== 待推送 %d 个文件 ====" % len(entries))
+    for rel, mode, raw in entries:
+        print("  %-55s %8d bytes  mode=%s" % (rel, len(raw), mode))
+
+    if dry_run:
+        print("\n--dry-run 模式，未实际推送。去掉 --dry-run 即执行。")
+        return 0
+
+    # 2. 取当前分支 HEAD 作为父提交
+    parent_commit = None
+    base_tree = None
+    branch_exists = False
+
+    ref = api("GET", "/repos/%s/%s/git/ref/heads/%s" % (owner, repo, branch),
+              token, allow_404=True)
+
+    if ref is None:
+        # 分支不存在，尝试用仓库默认分支作为基底
+        info = api("GET", "/repos/%s/%s" % (owner, repo), token)
+        default_branch = info.get("default_branch") or "main"
+        if default_branch != branch:
+            print("分支 %s 不存在，尝试默认分支 %s" % (branch, default_branch))
+        ref = api("GET", "/repos/%s/%s/git/ref/heads/%s" % (owner, repo, default_branch),
+                  token, allow_404=True)
+
+    if ref is not None:
+        parent_commit = ref["object"]["sha"]
+        branch_exists = True
+        commit_obj = api("GET", "/repos/%s/%s/git/commits/%s" % (owner, repo, parent_commit), token)
+        base_tree = commit_obj["tree"]["sha"]
+        print("父提交: %s" % parent_commit[:12])
+    else:
+        print("仓库为空，将创建首个提交")
+
+    # 3. 逐个上传 blob
+    print("\n---- 上传 blob ----")
+    tree_items = []
+    for rel, mode, raw in entries:
+        blob = api("POST", "/repos/%s/%s/git/blobs" % (owner, repo), token, {
+            "content": base64.b64encode(raw).decode("ascii"),
+            "encoding": "base64",
+        })
+        tree_items.append({
+            "path": rel,
+            "mode": mode,
+            "type": "blob",
+            "sha": blob["sha"],
+        })
+        print("  %-55s -> %s" % (rel, blob["sha"][:12]))
+
+    # 4. 建 tree（base_tree 保证其它未改文件不动）
+    tree_payload = {"tree": tree_items}
+    if base_tree:
+        tree_payload["base_tree"] = base_tree
+    tree = api("POST", "/repos/%s/%s/git/trees" % (owner, repo), token, tree_payload)
+    print("\n新 tree: %s" % tree["sha"][:12])
+
+    # 5. 建 commit
+    message = os.environ.get("COMMIT_MESSAGE") or \
+        "feat: MCP Server 改为监听 0.0.0.0（局域网可访问）+ 增加 CI 构建"
+    commit_payload = {"message": message, "tree": tree["sha"]}
+    if parent_commit:
+        commit_payload["parents"] = [parent_commit]
+
+    new_commit = api("POST", "/repos/%s/%s/git/commits" % (owner, repo), token, commit_payload)
+    print("新提交: %s" % new_commit["sha"][:12])
+
+    # 6. 移动分支指针
+    if branch_exists:
+        api("PATCH", "/repos/%s/%s/git/refs/heads/%s" % (owner, repo, branch), token, {
+            "sha": new_commit["sha"],
+            "force": False,
+        })
+    else:
+        api("POST", "/repos/%s/%s/git/refs" % (owner, repo), token, {
+            "ref": "refs/heads/%s" % branch,
+            "sha": new_commit["sha"],
+        })
+
+    print("\n==== 推送成功 ====")
+    print("分支: %s" % branch)
+    print("提交: https://github.com/%s/%s/commit/%s" % (owner, repo, new_commit["sha"]))
+    print("Actions: https://github.com/%s/%s/actions" % (owner, repo))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except RuntimeError as e:
+        print("\n[失败] %s" % e)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n已中断")
+        sys.exit(130)
