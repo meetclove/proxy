@@ -177,10 +177,18 @@ jobs:
 
       # 本仓库 libapp.so / libflutter.so 只提供 arm64-v8a，
       # 其他 ABI 缺少产物会导致构建失败，所以必须指定 target-platform。
+      #
+      # --android-skip-build-dependency-validation 是必需的：
+      #   Flutter 3.50 要求 AGP >= 9.1.1、Gradle >= 9.5.0，
+      #   但本项目锁定 AGP 8.11.1 + Gradle 9.3.1（原作者验证过的组合）。
+      #   升 AGP 9 属于大版本跳跃（namespace / Kotlin DSL / 构建脚本均需重写），
+      #   风险远大于收益，所以跳过这项“最低版本”校验。
+      #   注意：这只是关掉版本门槛检查，不影响实际编译。
       - name: Build release APK
         run: |
           flutter build apk --release \
-            --target-platform android-arm64
+            --target-platform android-arm64 \
+            --android-skip-build-dependency-validation
 
       - name: Show output
         run: |
